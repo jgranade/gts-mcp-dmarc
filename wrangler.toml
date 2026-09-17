@@ -1,0 +1,44 @@
+name = "gts-dmarc-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+workers_dev = false
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[vars]
+HALOPSA_BASE_URL = "https://service.granade.us/api"
+
+# Halo client custom field holding the comma-separated sending domains.
+# Resolved by NAME at runtime, never by numeric id.
+HALO_EMAIL_DOMAINS_FIELD = "CFClientEmailDomains"
+
+# A source is treated as "new" for alerting if first seen within this window.
+NEW_SOURCE_WINDOW_DAYS = "3"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gts-dmarc"
+# Create with: npx wrangler d1 create gts-dmarc
+# then paste the returned id here.
+database_id = "REPLACE_ME"
+
+# Nightly: refresh the Halo domain map, then evaluate new failing sources.
+[triggers]
+crons = ["0 7 * * *"]
+
+# Secrets (set via: npx wrangler secret put SECRET_NAME)
+# MCP_AUTH_TOKEN          - bearer token for /mcp
+# HALOPSA_CLIENT_ID       - Aimee's client-credentials app (read:customers)
+# HALOPSA_CLIENT_SECRET
+# N8N_ALERT_WEBHOOK       - posts new-failing-source alerts into halo-triage
+
+# Email Routing (configure in Cloudflare dashboard, zone granadeops.com):
+#   Email > Email Routing > Routes > rua@granadeops.com > Send to Worker > gts-dmarc-mcp
+#
+# Custom domain "dmarc.mcp.granadeops.com" — Workers & Pages > gts-dmarc-mcp
+#   > Settings > Domains & Routes

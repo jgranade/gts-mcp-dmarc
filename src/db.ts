@@ -1,4 +1,4 @@
-import { Env, nowSec } from './env.js';
+import { Env, normalizeDomain, nowSec } from './env.js';
 import type { DmarcReport } from './ingest/parse.js';
 
 export interface StoreResult {
@@ -245,6 +245,118 @@ export async function newFailingSources(env: Env, windowDays: number) {
     client_name: string | null;
     messages: number;
   }>;
+}
+
+export interface DomainMapEntry {
+  domain: string;
+  client_id: number;
+  client_name: string;
+}
+
+export interface SetMapResult {
+  submitted: number;
+  added: string[];
+  updated: string[];
+  removed: string[];
+  unchanged: number;
+  rejected: string[];
+  replace: boolean;
+  dry_run: boolean;
+}
+
+/**
+ * Reconcile the domain -> client map against what the caller supplies.
+ *
+ * Halo remains the source of record; this is its cache. Entries land with
+ * source='halo'. Rows added by hand (source='local') are never touched, so
+ * exceptions Halo cannot express survive every push.
+ *
+ * replace=true removes halo-sourced rows absent from the payload, which is what
+ * you want after reading ALL clients. replace=false only adds and updates,
+ * which is what you want when pushing a single client.
+ */
+export async function setDomainMap(
+  env: Env,
+  entries: DomainMapEntry[],
+  replace: boolean,
+  dryRun: boolean
+): Promise<SetMapResult> {
+  const desired = new Map<string, DomainMapEntry>();
+  const rejected: string[] = [];
+
+  for (const e of entries) {
+    const domain = normalizeDomain(e.domain);
+    // A dotless value can never match a report's policy domain. Refuse it here
+    // rather than storing a row that silently maps nothing.
+    if (!domain.includes('.')) {
+      rejected.push(String(e.domain));
+      continue;
+    }
+    desired.set(domain, { domain, client_id: e.client_id, client_name: e.client_name });
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT domain, client_id FROM domain_map WHERE source = 'halo'`
+  ).all<{ domain: string; client_id: number }>();
+
+  const current = new Map((results ?? []).map((r) => [r.domain, r.client_id]));
+
+  const added: string[] = [];
+  const updated: string[] = [];
+  const removed: string[] = [];
+  let unchanged = 0;
+
+  for (const [domain, info] of desired) {
+    if (!current.has(domain)) added.push(domain);
+    else if (current.get(domain) !== info.client_id) updated.push(domain);
+    else unchanged++;
+  }
+
+  if (replace) {
+    for (const domain of current.keys()) {
+      if (!desired.has(domain)) removed.push(domain);
+    }
+  }
+
+  if (!dryRun) {
+    const ts = nowSec();
+    const statements: D1PreparedStatement[] = [];
+
+    for (const [domain, info] of desired) {
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO domain_map (domain, client_id, client_name, source, updated_at)
+           VALUES (?, ?, ?, 'halo', ?)
+           ON CONFLICT(domain) DO UPDATE SET
+             client_id = excluded.client_id,
+             client_name = excluded.client_name,
+             source = 'halo',
+             updated_at = excluded.updated_at`
+        ).bind(domain, info.client_id, info.client_name, ts)
+      );
+      // A domain that now maps is no longer unmapped.
+      statements.push(env.DB.prepare(`DELETE FROM unmapped WHERE domain = ?`).bind(domain));
+    }
+
+    for (const domain of removed) {
+      statements.push(
+        env.DB.prepare(`DELETE FROM domain_map WHERE domain = ? AND source = 'halo'`).bind(domain)
+      );
+    }
+
+    if (statements.length > 0) await env.DB.batch(statements);
+  }
+
+  return {
+    submitted: entries.length,
+    added,
+    updated,
+    removed,
+    unchanged,
+    rejected,
+    replace,
+    dry_run: dryRun,
+  };
 }
 
 export async function markAlerted(env: Env, pairs: Array<{ domain: string; source_ip: string }>) {

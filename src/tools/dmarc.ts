@@ -5,8 +5,9 @@ import {
   domainSummary,
   unmappedDomains,
   newFailingSources,
+  setDomainMap,
+  type DomainMapEntry,
 } from '../db.js';
-import { syncDomainMap } from '../halo.js';
 
 const DEFAULT_DAYS = 30;
 
@@ -99,22 +100,54 @@ export const dmarcTools = [
       newFailingSources(env, Number(args.days ?? env.NEW_SOURCE_WINDOW_DAYS ?? 3)),
   },
   {
-    name: 'dmarc_sync_domain_map',
+    name: 'dmarc_set_domain_map',
     description:
-      'Refresh the domain-to-client map from the Halo client Email Domains custom field. Halo is ' +
-      'the source of record; this only updates the local cache. Runs nightly on its own — call it ' +
-      'manually after populating or correcting Email Domains in Halo so the change takes effect ' +
-      'immediately. Rows added by hand (source=local) are never touched. Use dry_run to preview.',
+      'Push the domain-to-client map into this worker. Halo is the source of record for which ' +
+      'domains belong to which client (client custom field Email Domains, CFClientEmailDomains); ' +
+      'this worker holds no Halo credentials and cannot read it itself. The intended flow is: read ' +
+      'the clients through the HaloPSA MCP in a session authenticated as a real user, split each ' +
+      "client's Email Domains value on commas, and pass the pairs here.\n\n" +
+      'Set replace=true only when passing EVERY client, since it deletes mapped domains absent ' +
+      'from the payload. Leave it false when correcting a single client. Rows added by hand ' +
+      '(source=local) are never touched either way. Use dry_run to preview the reconcile.',
     inputSchema: {
       type: 'object',
       properties: {
+        entries: {
+          type: 'array',
+          description: 'One entry per domain. A client with three domains contributes three entries.',
+          items: {
+            type: 'object',
+            properties: {
+              domain: {
+                type: 'string',
+                description: 'A single sending domain. Case, @ and trailing dots are tolerated.',
+              },
+              client_id: { type: 'number', description: 'HaloPSA client id.' },
+              client_name: { type: 'string', description: 'HaloPSA client name, for display.' },
+            },
+            required: ['domain', 'client_id', 'client_name'],
+          },
+        },
+        replace: {
+          type: 'boolean',
+          description:
+            'Delete mapped domains not present in entries. Only safe when passing every client. ' +
+            'Default false.',
+        },
         dry_run: {
           type: 'boolean',
           description: 'Report what would change without writing. Default false.',
         },
       },
+      required: ['entries'],
     },
     handler: async (env: Env, args: Record<string, unknown>) =>
-      syncDomainMap(env, Boolean(args.dry_run)),
+      setDomainMap(
+        env,
+        (args.entries ?? []) as DomainMapEntry[],
+        Boolean(args.replace),
+        Boolean(args.dry_run)
+      ),
   },
 ];

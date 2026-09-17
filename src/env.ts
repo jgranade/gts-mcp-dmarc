@@ -2,14 +2,10 @@ export interface Env {
   DB: D1Database;
 
   // vars
-  HALOPSA_BASE_URL: string;
-  HALO_EMAIL_DOMAINS_FIELD: string;
   NEW_SOURCE_WINDOW_DAYS: string;
 
   // secrets
   MCP_AUTH_TOKEN: string;
-  HALOPSA_CLIENT_ID: string;
-  HALOPSA_CLIENT_SECRET: string;
   N8N_ALERT_WEBHOOK?: string;
 }
 

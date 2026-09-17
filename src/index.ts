@@ -5,22 +5,34 @@ import { Env } from './env.js';
 import { dmarcTools } from './tools/dmarc.js';
 import { handleReportEmail } from './ingest/email.js';
 import { markAlerted, newFailingSources } from './db.js';
-import { syncDomainMap } from './halo.js';
 
 const allTools = [...dmarcTools];
+
+/** Build a zod type for one JSON-schema node. Handles object and array nesting. */
+function buildZodType(schema: Record<string, unknown>): z.ZodTypeAny {
+  const describe = (t: z.ZodTypeAny) => t.describe(String(schema.description ?? ''));
+
+  if (schema.type === 'number') return describe(z.number());
+  if (schema.type === 'boolean') return describe(z.boolean());
+
+  if (schema.type === 'array') {
+    const items = (schema.items ?? { type: 'string' }) as Record<string, unknown>;
+    return describe(z.array(buildZodType(items)));
+  }
+
+  if (schema.type === 'object') {
+    const props = (schema.properties ?? {}) as Record<string, unknown>;
+    const required = schema.required as string[] | undefined;
+    return describe(z.object(buildZodShape(props, required)));
+  }
+
+  return describe(z.string());
+}
 
 function buildZodShape(properties: Record<string, unknown>, required?: string[]) {
   const shape: Record<string, z.ZodTypeAny> = {};
   for (const [key, schema] of Object.entries(properties)) {
-    const s = schema as Record<string, unknown>;
-    let zField: z.ZodTypeAny;
-    if (s.type === 'number') {
-      zField = z.number().describe(String(s.description ?? ''));
-    } else if (s.type === 'boolean') {
-      zField = z.boolean().describe(String(s.description ?? ''));
-    } else {
-      zField = z.string().describe(String(s.description ?? ''));
-    }
+    let zField = buildZodType(schema as Record<string, unknown>);
     if (!required?.includes(key)) {
       zField = zField.optional();
     }
@@ -110,22 +122,14 @@ export default {
   },
 
   /**
-   * Nightly: refresh the Halo domain map first so alerts carry the right client,
-   * then push new failing sources to n8n.
+   * Nightly: push new failing sources to n8n.
+   *
+   * The domain map is NOT refreshed here. This worker holds no Halo credentials —
+   * the map is pushed in via dmarc_set_domain_map from a session already
+   * authenticated as a real user. Drift surfaces in the unmapped table rather
+   * than requiring a service identity to prevent it.
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
-    try {
-      const sync = await syncDomainMap(env, false);
-      console.log(JSON.stringify({ event: 'domain_map_synced', ...sync }));
-    } catch (error) {
-      console.error(
-        JSON.stringify({
-          event: 'domain_map_sync_failed',
-          error: error instanceof Error ? error.message : String(error),
-        })
-      );
-    }
-
     const windowDays = Number(env.NEW_SOURCE_WINDOW_DAYS ?? 3);
     const pending = await newFailingSources(env, windowDays);
     if (pending.length === 0) return;

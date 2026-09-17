@@ -11,12 +11,6 @@ enabled = true
 invocation_logs = true
 
 [vars]
-HALOPSA_BASE_URL = "https://service.granade.us/api"
-
-# Halo client custom field holding the comma-separated sending domains.
-# Resolved by NAME at runtime, never by numeric id.
-HALO_EMAIL_DOMAINS_FIELD = "CFClientEmailDomains"
-
 # A source is treated as "new" for alerting if first seen within this window.
 NEW_SOURCE_WINDOW_DAYS = "3"
 
@@ -25,17 +19,18 @@ binding = "DB"
 database_name = "gts-dmarc"
 # Create with: npx wrangler d1 create gts-dmarc
 # then paste the returned id here.
-database_id = "REPLACE_ME"
+database_id = "b9f3e20a-8f9e-4e9c-bb93-6b0c3e707142"
 
-# Nightly: refresh the Halo domain map, then evaluate new failing sources.
+# Nightly: evaluate new failing sources and alert.
 [triggers]
 crons = ["0 7 * * *"]
 
 # Secrets (set via: npx wrangler secret put SECRET_NAME)
-# MCP_AUTH_TOKEN          - bearer token for /mcp
-# HALOPSA_CLIENT_ID       - Aimee's client-credentials app (read:customers)
-# HALOPSA_CLIENT_SECRET
-# N8N_ALERT_WEBHOOK       - posts new-failing-source alerts into halo-triage
+# MCP_AUTH_TOKEN      - bearer token for /mcp
+# N8N_ALERT_WEBHOOK   - posts new-failing-source alerts into halo-triage (optional)
+#
+# No Halo credentials. The domain map is pushed in via dmarc_set_domain_map from
+# a session already authenticated as a real user.
 
 # Email Routing (configure in Cloudflare dashboard, zone granadeops.com):
 #   Email > Email Routing > Routes > rua@granadeops.com > Send to Worker > gts-dmarc-mcp

@@ -209,6 +209,29 @@ export async function allDomains(env: Env) {
   return results;
 }
 
+/** Distinct mapped clients whose name contains the search text. For resolving names without Halo. */
+export async function findMappedClients(env: Env, search: string) {
+  const { results } = await env.DB.prepare(
+    `SELECT DISTINCT client_id AS id, client_name AS name
+     FROM domain_map
+     WHERE client_id IS NOT NULL AND LOWER(client_name) LIKE ?
+     ORDER BY client_name LIMIT 25`
+  )
+    .bind(`%${search.toLowerCase()}%`)
+    .all<{ id: number; name: string }>();
+  return results ?? [];
+}
+
+/** Every domain mapped to one client, with its source. */
+export async function clientMappedDomains(env: Env, clientId: number) {
+  const { results } = await env.DB.prepare(
+    `SELECT domain, client_name, source FROM domain_map WHERE client_id = ? ORDER BY domain`
+  )
+    .bind(clientId)
+    .all<{ domain: string; client_name: string | null; source: string }>();
+  return results ?? [];
+}
+
 export async function unmappedDomains(env: Env) {
   const { results } = await env.DB.prepare(
     `SELECT domain, first_seen, last_seen, report_count

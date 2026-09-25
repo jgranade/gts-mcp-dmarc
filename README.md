@@ -84,12 +84,13 @@ arriving, not when the record is published.
 
 | Tool | Use |
 |---|---|
+| `dmarc_client_summary` | Every domain for one client, by name, in one call; flags Halo drift |
 | `dmarc_domain_summary` | Is this domain safe to tighten? |
 | `dmarc_sources` | Which sender is blocking enforcement? |
 | `dmarc_list_domains` | Fleet posture, who is still at `p=none` |
 | `dmarc_unmapped_domains` | Halo Email Domains audit |
 | `dmarc_new_failing_sources` | What is pending alert |
-| `dmarc_sync_client` | Sync one Halo client's Email Domains (per-user only) |
+| `dmarc_sync_client` | Sync one Halo client's Email Domains by name or id (per-user only) |
 | `dmarc_set_domain_map` | Low-level push of domain → client pairs; bulk loads |
 
 ## Notes

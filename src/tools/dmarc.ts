@@ -1,7 +1,9 @@
 import { ToolContext as Env, isAdmin, normalizeDomain } from '../env.js';
 import { getClientEmailDomains } from '../halo.js';
+import { resolveClient } from '../clients.js';
 import {
   allDomains,
+  clientMappedDomains,
   domainSources,
   domainSummary,
   unmappedDomains,
@@ -12,7 +14,77 @@ import {
 
 const DEFAULT_DAYS = 30;
 
+const CLIENT_PROPS = {
+  client_name: {
+    type: 'string',
+    description:
+      'Halo client name as a tech would say it, e.g. "Turner Fence". An exact name wins; if the ' +
+      'name is ambiguous the tool returns the candidates with ids instead of guessing.',
+  },
+  client_id: {
+    type: 'number',
+    description: 'HaloPSA client id. Use instead of client_name when known.',
+  },
+};
+
 export const dmarcTools = [
+  {
+    name: 'dmarc_client_summary',
+    description:
+      'DMARC posture for every domain of one client in a single call: per domain, the published ' +
+      'policy, message volume, alignment %, failing source count, and last report. Accepts the ' +
+      'client name. This is the tool for "DMARC summary for Turner Fence" and for Day 2 / Day 7 ' +
+      'checks in the rollout runbook. On the per-user connector it also compares the map with the ' +
+      "client's Email Domains field in Halo and lists anything not yet synced.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...CLIENT_PROPS,
+        days: { type: 'number', description: `Lookback window in days. Default ${DEFAULT_DAYS}.` },
+      },
+    },
+    handler: async (ctx: Env, args: Record<string, unknown>) => {
+      const client = await resolveClient(ctx, args);
+      const days = Number(args.days ?? DEFAULT_DAYS);
+
+      const mapped = await clientMappedDomains(ctx, client.id);
+      const domains = await Promise.all(mapped.map((m) => domainSummary(ctx, m.domain, days)));
+
+      // Drift check against Halo, when we can read it. This is the "edited but
+      // not synced" case surfacing on its own instead of in Troubleshooting.
+      let halo_drift: { in_halo_not_mapped: string[]; mapped_not_in_halo: string[] } | null = null;
+      let clientName = client.name || mapped[0]?.client_name || '';
+      if (ctx.haloToken) {
+        const halo = await getClientEmailDomains(ctx, client.id);
+        clientName = halo.client_name;
+        const mappedSet = new Set(mapped.filter((m) => m.source === 'halo').map((m) => m.domain));
+        const haloSet = new Set(halo.domains);
+        halo_drift = {
+          in_halo_not_mapped: halo.domains.filter((d) => !mappedSet.has(d)),
+          mapped_not_in_halo: [...mappedSet].filter((d) => !haloSet.has(d)),
+        };
+      }
+
+      const inSync =
+        halo_drift === null ||
+        (halo_drift.in_halo_not_mapped.length === 0 && halo_drift.mapped_not_in_halo.length === 0);
+
+      return {
+        client_id: client.id,
+        client_name: clientName,
+        days,
+        domain_count: domains.length,
+        domains,
+        halo_drift,
+        note:
+          domains.length === 0
+            ? 'No domains are mapped to this client. Fill in Email Domains in Halo, then run dmarc_sync_client.'
+            : inSync
+              ? undefined
+              : 'The map does not match Halo Email Domains. Run dmarc_sync_client for this client.',
+      };
+    },
+  },
   {
     name: 'dmarc_domain_summary',
     description:
@@ -104,30 +176,33 @@ export const dmarcTools = [
     name: 'dmarc_sync_client',
     description:
       "Sync one Halo client's Email Domains (custom field CFClientEmailDomains) into the DMARC " +
-      'domain map, reading Halo as the signed-in agent. This is the normal way to map domains: ' +
-      'after editing the Email Domains field in Halo, call this with the client id. The sync is ' +
-      "exact for that client — domains added in Halo are mapped, domains removed from that client's " +
-      'field are unmapped, and a domain previously mapped to a different client moves to this one. ' +
-      "Other clients' mappings are never touched. Use dry_run to preview. Only available on the " +
-      'per-user connector.',
+      'domain map, reading Halo as the signed-in agent. Accepts the client name ("Turner Fence"). ' +
+      'This is the normal way to map domains: after editing the Email Domains field in Halo, run ' +
+      "this for that client. The sync is exact for that client — domains added in Halo are mapped, " +
+      "domains removed from that client's field are unmapped, and a domain previously mapped to a " +
+      "different client moves to this one. Other clients' mappings are never touched. Use dry_run " +
+      'to preview. Only available on the per-user connector.',
     inputSchema: {
       type: 'object',
       properties: {
-        client_id: { type: 'number', description: 'HaloPSA client id.' },
+        ...CLIENT_PROPS,
         dry_run: {
           type: 'boolean',
           description: 'Report what would change without writing. Default false.',
         },
       },
-      required: ['client_id'],
     },
     handler: async (ctx: Env, args: Record<string, unknown>) => {
-      const clientId = Number(args.client_id);
-      if (!Number.isFinite(clientId) || clientId <= 0) {
-        throw new Error('client_id must be a positive Halo client id.');
+      if (!ctx.haloToken) {
+        // Fail before name resolution, whose map fallback would otherwise produce a confusing error.
+        throw new Error(
+          'dmarc_sync_client reads Halo as the signed-in agent and only runs on the per-user ' +
+            'connector. Use dmarc_set_domain_map on the service connector.'
+        );
       }
+      const client = await resolveClient(ctx, args);
       const dryRun = Boolean(args.dry_run);
-      const halo = await getClientEmailDomains(ctx, clientId);
+      const halo = await getClientEmailDomains(ctx, client.id);
 
       const result = await setDomainMap(
         ctx,

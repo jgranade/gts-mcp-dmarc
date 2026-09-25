@@ -97,3 +97,32 @@ export async function getClientEmailDomains(
     domains,
   };
 }
+
+export interface HaloClientRef {
+  id: number;
+  name: string;
+  inactive: boolean;
+}
+
+/** GET /Client?search= as the signed-in agent. Name match only; ids, names, inactive flag. */
+export async function searchHaloClients(ctx: ToolContext, search: string): Promise<HaloClientRef[]> {
+  if (!ctx.haloToken) throw new Error('Halo search requires the per-user connector.');
+  const token = await ctx.haloToken();
+  const url = new URL(`${ctx.HALOPSA_BASE_URL}/Client`);
+  url.searchParams.set('search', search);
+  url.searchParams.set('count', '25');
+  url.searchParams.set('includedetails', 'false');
+
+  const response = await fetchWithTimeout(url.toString(), {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`HaloPSA GET /Client?search failed: ${response.status} ${text.slice(0, 500)}`);
+  }
+
+  const body = JSON.parse(text) as { clients?: Array<{ id?: number; name?: string; inactive?: boolean }> };
+  return (body.clients ?? [])
+    .filter((c) => typeof c.id === 'number')
+    .map((c) => ({ id: c.id as number, name: String(c.name ?? ''), inactive: Boolean(c.inactive) }));
+}

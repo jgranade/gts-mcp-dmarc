@@ -260,6 +260,8 @@ export interface SetMapResult {
   removed: string[];
   unchanged: number;
   rejected: string[];
+  /** Domains held by a hand-added (source=local) row. Left alone; the local row wins. */
+  skipped_local: string[];
   replace: boolean;
   dry_run: boolean;
 }
@@ -274,12 +276,18 @@ export interface SetMapResult {
  * replace=true removes halo-sourced rows absent from the payload, which is what
  * you want after reading ALL clients. replace=false only adds and updates,
  * which is what you want when pushing a single client.
+ *
+ * scopeClientId narrows replace to one client: only that client's halo rows are
+ * candidates for removal. This is what makes a single-client sync exact — a
+ * domain deleted from that client's Email Domains leaves the map — without any
+ * risk to other clients' rows. Ignored unless replace is true.
  */
 export async function setDomainMap(
   env: Env,
   entries: DomainMapEntry[],
   replace: boolean,
-  dryRun: boolean
+  dryRun: boolean,
+  scopeClientId?: number
 ): Promise<SetMapResult> {
   const desired = new Map<string, DomainMapEntry>();
   const rejected: string[] = [];
@@ -296,10 +304,23 @@ export async function setDomainMap(
   }
 
   const { results } = await env.DB.prepare(
-    `SELECT domain, client_id FROM domain_map WHERE source = 'halo'`
-  ).all<{ domain: string; client_id: number }>();
+    `SELECT domain, client_id, source FROM domain_map`
+  ).all<{ domain: string; client_id: number; source: string }>();
 
-  const current = new Map((results ?? []).map((r) => [r.domain, r.client_id]));
+  const current = new Map(
+    (results ?? []).filter((r) => r.source === 'halo').map((r) => [r.domain, r.client_id])
+  );
+
+  // Previously the upsert below overwrote local rows with source='halo', which
+  // contradicted the "local rows are never touched" contract. Pull them out of
+  // the desired set instead, and say so in the result.
+  const skippedLocal: string[] = [];
+  for (const r of results ?? []) {
+    if (r.source !== 'halo' && desired.has(r.domain)) {
+      desired.delete(r.domain);
+      skippedLocal.push(r.domain);
+    }
+  }
 
   const added: string[] = [];
   const updated: string[] = [];
@@ -313,7 +334,8 @@ export async function setDomainMap(
   }
 
   if (replace) {
-    for (const domain of current.keys()) {
+    for (const [domain, clientId] of current) {
+      if (scopeClientId !== undefined && clientId !== scopeClientId) continue;
       if (!desired.has(domain)) removed.push(domain);
     }
   }
@@ -354,6 +376,7 @@ export async function setDomainMap(
     removed,
     unchanged,
     rejected,
+    skipped_local: skippedLocal,
     replace,
     dry_run: dryRun,
   };

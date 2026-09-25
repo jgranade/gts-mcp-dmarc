@@ -14,6 +14,23 @@ invocation_logs = true
 # A source is treated as "new" for alerting if first seen within this window.
 NEW_SOURCE_WINDOW_DAYS = "3"
 
+HALOPSA_BASE_URL = "https://service.granade.us/api"
+
+# Halo allowlists this URI exactly on the DMARC OAuth app. Not derived from the request:
+# a wrangler dev or workers.dev origin would be rejected by Halo.
+HALOPSA_OAUTH_REDIRECT_URI = "https://dmarc.mcp.granadeops.com/callback"
+
+# Halo agent ids allowed to run dmarc_set_domain_map with replace=true on /mcp/user.
+# 3 = John Granade, 21 = Wayne Boyles. Everything else is open to any signed-in agent.
+DMARC_ADMIN_AGENT_IDS = "3,21"
+
+# Grant, token and client storage for @cloudflare/workers-oauth-provider (/mcp/user only).
+# Binding name is fixed by the library.
+# Create with: npx wrangler kv namespace create OAUTH_KV   then paste the id here.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "f9acbdb782424dc4b578ad27e93a09b3"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "gts-dmarc"
@@ -26,11 +43,12 @@ database_id = "b9f3e20a-8f9e-4e9c-bb93-6b0c3e707142"
 crons = ["0 7 * * *"]
 
 # Secrets (set via: npx wrangler secret put SECRET_NAME)
-# MCP_AUTH_TOKEN      - bearer token for /mcp
-# N8N_ALERT_WEBHOOK   - posts new-failing-source alerts into halo-triage (optional)
+# MCP_AUTH_TOKEN               - bearer token for /mcp (service path: n8n, legacy configs)
+# N8N_ALERT_WEBHOOK            - posts new-failing-source alerts into halo-triage (optional)
+# HALOPSA_OAUTH_CLIENT_ID      - Halo authorization-code app for /mcp/user
+# HALOPSA_OAUTH_CLIENT_SECRET  - (Halo delegates the login to Entra SSO)
 #
-# No Halo credentials. The domain map is pushed in via dmarc_set_domain_map from
-# a session already authenticated as a real user.
+# No Halo service identity. /mcp/user reads Halo with the signed-in agent's own token.
 
 # Email Routing (configure in Cloudflare dashboard, zone granadeops.com):
 #   Email > Email Routing > Routes > rua@granadeops.com > Send to Worker > gts-dmarc-mcp

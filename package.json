@@ -11,6 +11,7 @@
     "db:init:local": "npx wrangler d1 execute gts-dmarc --local --file=./schema.sql"
   },
   "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.10.4",
     "@cloudflare/workers-types": "^4.20241205.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "fast-xml-parser": "^4.5.0",

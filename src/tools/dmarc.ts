@@ -1,4 +1,5 @@
-import { Env, normalizeDomain } from '../env.js';
+import { ToolContext as Env, isAdmin, normalizeDomain } from '../env.js';
+import { getClientEmailDomains } from '../halo.js';
 import {
   allDomains,
   domainSources,
@@ -100,16 +101,82 @@ export const dmarcTools = [
       newFailingSources(env, Number(args.days ?? env.NEW_SOURCE_WINDOW_DAYS ?? 3)),
   },
   {
+    name: 'dmarc_sync_client',
+    description:
+      "Sync one Halo client's Email Domains (custom field CFClientEmailDomains) into the DMARC " +
+      'domain map, reading Halo as the signed-in agent. This is the normal way to map domains: ' +
+      'after editing the Email Domains field in Halo, call this with the client id. The sync is ' +
+      "exact for that client — domains added in Halo are mapped, domains removed from that client's " +
+      'field are unmapped, and a domain previously mapped to a different client moves to this one. ' +
+      "Other clients' mappings are never touched. Use dry_run to preview. Only available on the " +
+      'per-user connector.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_id: { type: 'number', description: 'HaloPSA client id.' },
+        dry_run: {
+          type: 'boolean',
+          description: 'Report what would change without writing. Default false.',
+        },
+      },
+      required: ['client_id'],
+    },
+    handler: async (ctx: Env, args: Record<string, unknown>) => {
+      const clientId = Number(args.client_id);
+      if (!Number.isFinite(clientId) || clientId <= 0) {
+        throw new Error('client_id must be a positive Halo client id.');
+      }
+      const dryRun = Boolean(args.dry_run);
+      const halo = await getClientEmailDomains(ctx, clientId);
+
+      const result = await setDomainMap(
+        ctx,
+        halo.domains.map((domain) => ({
+          domain,
+          client_id: halo.client_id,
+          client_name: halo.client_name,
+        })),
+        true, // exact for this client...
+        dryRun,
+        halo.client_id // ...and only this client
+      );
+
+      const warnings: string[] = [];
+      if (halo.domains.length === 0) {
+        warnings.push(
+          'Email Domains is empty in Halo for this client. Any domains previously mapped to it ' +
+            (dryRun ? 'would be' : 'were') +
+            ' unmapped.'
+        );
+      }
+      if (halo.inactive) warnings.push('This client is inactive in Halo.');
+      if (result.updated.length > 0) {
+        warnings.push(
+          `Moved from another client: ${result.updated.join(', ')}. Confirm the domain was ` +
+            'removed from the other client in Halo, or the next sync of that client will move it back.'
+        );
+      }
+
+      return {
+        client_id: halo.client_id,
+        client_name: halo.client_name,
+        halo_email_domains: halo.raw,
+        ...result,
+        warnings,
+      };
+    },
+  },
+  {
     name: 'dmarc_set_domain_map',
     description:
-      'Push the domain-to-client map into this worker. Halo is the source of record for which ' +
-      'domains belong to which client (client custom field Email Domains, CFClientEmailDomains); ' +
-      'this worker holds no Halo credentials and cannot read it itself. The intended flow is: read ' +
-      'the clients through the HaloPSA MCP in a session authenticated as a real user, split each ' +
-      "client's Email Domains value on commas, and pass the pairs here.\n\n" +
+      'Low-level push of domain-to-client pairs into the map. For a single client, prefer ' +
+      'dmarc_sync_client, which reads Halo itself and cannot get the list wrong. Use this for ' +
+      'bulk loads or when working from the service connector, which has no Halo access: read ' +
+      "the clients through the HaloPSA MCP, split each client's Email Domains on commas, and " +
+      'pass the pairs here.\n\n' +
       'Set replace=true only when passing EVERY client, since it deletes mapped domains absent ' +
-      'from the payload. Leave it false when correcting a single client. Rows added by hand ' +
-      '(source=local) are never touched either way. Use dry_run to preview the reconcile.',
+      'from the payload; on the per-user connector it is restricted to GTS admins. Rows added ' +
+      'by hand (source=local) are never touched. Use dry_run to preview the reconcile.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -142,12 +209,17 @@ export const dmarcTools = [
       },
       required: ['entries'],
     },
-    handler: async (env: Env, args: Record<string, unknown>) =>
-      setDomainMap(
-        env,
-        (args.entries ?? []) as DomainMapEntry[],
-        Boolean(args.replace),
-        Boolean(args.dry_run)
-      ),
+    handler: async (env: Env, args: Record<string, unknown>) => {
+      const replace = Boolean(args.replace);
+      const dryRun = Boolean(args.dry_run);
+      // A dry run changes nothing, so anyone may preview a fleet-wide reconcile.
+      if (replace && !dryRun && !isAdmin(env)) {
+        throw new Error(
+          'replace=true rewrites the whole domain map and is restricted to GTS admins. ' +
+            'To correct one client, use dmarc_sync_client instead.'
+        );
+      }
+      return setDomainMap(env, (args.entries ?? []) as DomainMapEntry[], replace, dryRun);
+    },
   },
 ];

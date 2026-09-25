@@ -1,69 +1,247 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import { z } from 'zod';
+import OAuthProvider, {
+  AuthorizationError,
+  OAuthError,
+  type AuthRequest,
+} from '@cloudflare/workers-oauth-provider';
 import { Env } from './env.js';
-import { dmarcTools } from './tools/dmarc.js';
+import { rejectStreamingGet, serveMcp } from './mcp.js';
 import { handleReportEmail } from './ingest/email.js';
 import { markAlerted, newFailingSources } from './db.js';
+import {
+  applyTokenSet,
+  buildHaloAuthorizeUrl,
+  clientTokenTTL,
+  exchangeAuthorizationCode,
+  HaloAuthError,
+  HaloUserProps,
+  refreshAccessToken,
+  resolveAgentIdentity,
+} from './haloauth.js';
 
-const allTools = [...dmarcTools];
+/**
+ * Three entry points, two MCP routes.
+ *
+ *   email       DMARC aggregate reports from Cloudflare Email Routing. Untouched by auth.
+ *   scheduled   Nightly new-failing-source alert to n8n. Untouched by auth.
+ *   fetch       /mcp        bearer MCP_AUTH_TOKEN. Service path for n8n and existing
+ *                           Desktop configs. Behaviour unchanged.
+ *               /mcp/user   OAuth, Halo as the identity provider (Halo delegates to Entra
+ *                           SSO). The Claude / Copilot connector for every tech.
+ *
+ * The OAuth wiring is ported from the HaloPSA worker, where it is in production. Read
+ * gts/mcp/halo/src/index.ts for the reasoning behind each piece; the comments here are
+ * the short version.
+ *
+ * IMPORTANT: OAuthProvider only implements fetch. The default export below must keep
+ * email and scheduled alongside it — drop email and reports bounce, and a bounced DMARC
+ * report is gone for good.
+ */
 
-/** Build a zod type for one JSON-schema node. Handles object and array nesting. */
-function buildZodType(schema: Record<string, unknown>): z.ZodTypeAny {
-  const describe = (t: z.ZodTypeAny) => t.describe(String(schema.description ?? ''));
+/** Env for tokenExchangeCallback, which the library calls without one. Constant per deployment. */
+let lastSeenEnv: Env | null = null;
 
-  if (schema.type === 'number') return describe(z.number());
-  if (schema.type === 'boolean') return describe(z.boolean());
+const AUTH_REQUEST_PREFIX = 'dmarc:authreq:';
+/** Long enough for an Entra SSO prompt with MFA; short enough to be useless if leaked. */
+const AUTH_REQUEST_TTL_SECONDS = 600;
 
-  if (schema.type === 'array') {
-    const items = (schema.items ?? { type: 'string' }) as Record<string, unknown>;
-    return describe(z.array(buildZodType(items)));
-  }
-
-  if (schema.type === 'object') {
-    const props = (schema.properties ?? {}) as Record<string, unknown>;
-    const required = schema.required as string[] | undefined;
-    return describe(z.object(buildZodShape(props, required)));
-  }
-
-  return describe(z.string());
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
-function buildZodShape(properties: Record<string, unknown>, required?: string[]) {
-  const shape: Record<string, z.ZodTypeAny> = {};
-  for (const [key, schema] of Object.entries(properties)) {
-    let zField = buildZodType(schema as Record<string, unknown>);
-    if (!required?.includes(key)) {
-      zField = zField.optional();
+function htmlResponse(body: string, status = 200): Response {
+  return new Response(body, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+function errorPage(title: string, detail: string, status = 400): Response {
+  return htmlResponse(
+    `<!doctype html><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
+      `<body style="font:14px/1.5 system-ui;max-width:44rem;margin:4rem auto;padding:0 1rem">` +
+      `<h1 style="font-size:1.2rem">${escapeHtml(title)}</h1>` +
+      `<pre style="white-space:pre-wrap;background:#f4f4f5;padding:1rem;border-radius:6px">${escapeHtml(detail)}</pre>` +
+      `</body>`,
+    status
+  );
+}
+
+/**
+ * Explicit approval before the Halo redirect. Without it, anyone could register a client
+ * via DCR and bounce an agent with a live Halo session straight through to their own
+ * redirect URI (confused deputy). Naming the client and destination makes that obvious.
+ */
+function consentPage(clientName: string, redirectUri: string, formAction: string): Response {
+  return htmlResponse(
+    `<!doctype html><meta charset="utf-8"><title>Authorize GTS DMARC access</title>` +
+      `<body style="font:14px/1.5 system-ui;max-width:34rem;margin:4rem auto;padding:0 1rem">` +
+      `<h1 style="font-size:1.25rem">Authorize GTS DMARC access</h1>` +
+      `<p><strong>${escapeHtml(clientName)}</strong> is asking to use the GTS DMARC tools as you.</p>` +
+      `<p style="color:#52525b">You will sign in with your Halo account next (Microsoft sign-in). ` +
+      `DMARC reports are read-only; mapping changes are logged under your name. Client details ` +
+      `are read from Halo with your own permissions.</p>` +
+      `<p style="color:#52525b">Sends results to: <code>${escapeHtml(redirectUri)}</code><br>` +
+      `If you did not start this, close this page.</p>` +
+      `<form method="post" action="${escapeHtml(formAction)}">` +
+      `<button type="submit" style="font:inherit;padding:.6rem 1.2rem;border:0;border-radius:6px;` +
+      `background:#18181b;color:#fff;cursor:pointer">Continue to sign-in</button>` +
+      `</form></body>`
+  );
+}
+
+/** 401 that sends an MCP client to refresh rather than give up. */
+function invalidToken(request: Request, description: string): Response {
+  const url = new URL(request.url);
+  const metadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
+  return new Response(JSON.stringify({ error: 'invalid_token', error_description: description }), {
+    status: 401,
+    headers: {
+      'Content-Type': 'application/json',
+      'WWW-Authenticate':
+        `Bearer error="invalid_token", error_description="${description.replace(/"/g, "'")}", ` +
+        `resource_metadata="${metadataUrl}"`,
+    },
+  });
+}
+
+/** GET /authorize shows consent; POST /authorize hands off to Halo. */
+async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+
+  let oauthRequest: AuthRequest;
+  try {
+    oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+  } catch (error) {
+    if (!(error instanceof AuthorizationError)) throw error;
+    if (!error.redirectUri) {
+      return errorPage('Authorization request rejected', `${error.code}: ${error.description}`);
     }
-    shape[key] = zField;
+    const redirect = new URL(error.redirectUri);
+    redirect.searchParams.set('error', error.code);
+    redirect.searchParams.set('error_description', error.description);
+    if (error.state) redirect.searchParams.set('state', error.state);
+    if (error.issuer) redirect.searchParams.set('iss', error.issuer);
+    return Response.redirect(redirect.toString(), 302);
   }
-  return shape;
+
+  const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+  if (!client) {
+    return errorPage('Unknown OAuth client', `No client is registered under id ${oauthRequest.clientId}.`);
+  }
+
+  if (request.method === 'GET') {
+    return consentPage(client.clientName || oauthRequest.clientId, oauthRequest.redirectUri, url.pathname + url.search);
+  }
+
+  // A cross-site POST would skip the consent page it exists to enforce.
+  const origin = request.headers.get('Origin');
+  if (origin !== url.origin) {
+    return errorPage(
+      'Authorization request rejected',
+      `This approval must be submitted from ${url.origin}. Start again from the beginning.`,
+      403
+    );
+  }
+
+  // Halo echoes state verbatim; keep the real request in KV and send an opaque handle.
+  const stateKey = crypto.randomUUID();
+  await env.OAUTH_KV.put(AUTH_REQUEST_PREFIX + stateKey, JSON.stringify(oauthRequest), {
+    expirationTtl: AUTH_REQUEST_TTL_SECONDS,
+  });
+
+  return Response.redirect(buildHaloAuthorizeUrl(env, stateKey), 302);
 }
 
-function createMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: 'gts-dmarc-mcp', version: '1.0.0' });
+/** GET /callback — Halo is done with the browser; turn its code into a grant. */
+async function handleCallback(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
 
-  for (const tool of allTools) {
-    const props = (tool.inputSchema.properties ?? {}) as Record<string, unknown>;
-    const required = (tool.inputSchema as Record<string, unknown>).required as string[] | undefined;
-    const shape = buildZodShape(props, required);
+  const haloError = url.searchParams.get('error');
+  if (haloError) {
+    return errorPage(
+      'Halo declined the sign-in',
+      `${haloError}: ${url.searchParams.get('error_description') ?? '(no description given)'}`
+    );
+  }
 
-    server.tool(tool.name, tool.description, shape, async (args) => {
-      try {
-        const result = await tool.handler(env, args as Record<string, unknown>);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
-      }
+  const code = url.searchParams.get('code');
+  const stateKey = url.searchParams.get('state');
+  if (!code || !stateKey) {
+    return errorPage('Invalid callback', 'Halo returned no authorization code or no state value.');
+  }
+
+  const stored = await env.OAUTH_KV.get(AUTH_REQUEST_PREFIX + stateKey);
+  if (!stored) {
+    return errorPage(
+      'Authorization request expired',
+      `This sign-in took longer than ${AUTH_REQUEST_TTL_SECONDS / 60} minutes, or the link was already used. Start again from your MCP client.`
+    );
+  }
+  // Single use, deleted before the exchange so a replayed callback cannot reuse it.
+  await env.OAUTH_KV.delete(AUTH_REQUEST_PREFIX + stateKey);
+  const oauthRequest = JSON.parse(stored) as AuthRequest;
+  const grantClient = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+
+  let props: HaloUserProps;
+  try {
+    const tokens = await exchangeAuthorizationCode(env, code);
+    const identity = await resolveAgentIdentity(env, tokens.access_token);
+    props = applyTokenSet(tokens, {
+      ...identity,
+      clientId: oauthRequest.clientId,
+      clientName: grantClient?.clientName,
     });
+  } catch (error) {
+    return errorPage('Halo rejected the authorization', error instanceof Error ? error.message : String(error));
   }
 
-  return server;
+  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+    request: oauthRequest,
+    // Grants are per agent per client: re-authorizing replaces rather than accumulates.
+    userId: String(props.agentId),
+    metadata: {
+      agentName: props.agentName,
+      agentEmail: props.agentEmail,
+      authorizedAt: new Date().toISOString(),
+    },
+    scope: oauthRequest.scope,
+    props,
+  });
+
+  return Response.redirect(redirectTo, 302);
 }
 
-export default {
+/** /mcp/user. The library has already validated the bearer and decrypted the grant into ctx.props. */
+const userApiHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (request.method === 'GET') return rejectStreamingGet();
+
+    const props = (ctx as ExecutionContext & { props?: HaloUserProps }).props;
+    if (!props?.accessToken) {
+      return invalidToken(request, 'This grant carries no Halo credentials. Reconnect the connector.');
+    }
+    if (props.expiresAt <= Date.now()) {
+      return invalidToken(request, 'The Halo access token behind this grant has expired.');
+    }
+
+    return serveMcp(request, {
+      ...env,
+      haloToken: async () => props.accessToken,
+      caller: {
+        authPath: 'user',
+        clientId: props.clientId,
+        clientName: props.clientName,
+        agentId: props.agentId,
+        agentName: props.agentName,
+        agentEmail: props.agentEmail,
+      },
+    });
+  },
+};
+
+/** Everything that is not /mcp/user. */
+const defaultHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
@@ -73,21 +251,78 @@ export default {
       });
     }
 
+    // Service path. Unchanged apart from the caller tag for the audit log.
     if (url.pathname === '/mcp') {
       const authHeader = request.headers.get('Authorization');
       if (!env.MCP_AUTH_TOKEN || authHeader !== `Bearer ${env.MCP_AUTH_TOKEN}`) {
         return new Response('Unauthorized', { status: 401 });
       }
+      return serveMcp(request, { ...env, caller: { authPath: 'service' } });
+    }
 
-      const server = createMcpServer(env);
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: undefined, // stateless mode
-      });
-      await server.connect(transport);
-      return transport.handleRequest(request);
+    if (url.pathname === '/authorize' && (request.method === 'GET' || request.method === 'POST')) {
+      return handleAuthorize(request, env);
+    }
+
+    if (url.pathname === '/callback') {
+      return handleCallback(request, env);
     }
 
     return new Response('Not found', { status: 404 });
+  },
+};
+
+const provider = new OAuthProvider<Env>({
+  apiRoute: '/mcp/user',
+  apiHandler: userApiHandler,
+  defaultHandler,
+  authorizeEndpoint: '/authorize',
+  tokenEndpoint: '/token',
+  // Claude and Copilot Studio both use dynamic client registration.
+  clientRegistrationEndpoint: '/register',
+
+  /** Refresh Halo's token underneath ours, before it expires. See the Halo worker for the full reasoning. */
+  tokenExchangeCallback: async (options) => {
+    const env = lastSeenEnv;
+    if (!env) {
+      throw new OAuthError('server_error', {
+        description: 'Worker environment unavailable during token exchange',
+        statusCode: 500,
+      });
+    }
+
+    const props = options.props as HaloUserProps;
+
+    if (options.grantType === 'authorization_code') {
+      return { accessTokenTTL: clientTokenTTL(props) };
+    }
+
+    if (options.grantType === 'refresh_token') {
+      let next: HaloUserProps;
+      try {
+        const tokens = await refreshAccessToken(env, props.refreshToken);
+        next = applyTokenSet(tokens, props, props.refreshToken);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const status = error instanceof HaloAuthError ? error.status : 0;
+        // 400/401: grant is dead, send the agent back through SSO. Anything else is Halo
+        // being unwell, and must not log everyone out.
+        if (status === 400 || status === 401) {
+          throw new OAuthError('invalid_grant', { description: message });
+        }
+        throw new OAuthError('temporarily_unavailable', { description: message, statusCode: 503 });
+      }
+      return { newProps: next, accessTokenTTL: clientTokenTTL(next) };
+    }
+
+    return undefined;
+  },
+});
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    lastSeenEnv = env;
+    return provider.fetch(request, env, ctx);
   },
 
   /**
@@ -124,10 +359,9 @@ export default {
   /**
    * Nightly: push new failing sources to n8n.
    *
-   * The domain map is NOT refreshed here. This worker holds no Halo credentials —
-   * the map is pushed in via dmarc_set_domain_map from a session already
-   * authenticated as a real user. Drift surfaces in the unmapped table rather
-   * than requiring a service identity to prevent it.
+   * The domain map is NOT refreshed here. This worker holds no Halo service
+   * identity; the map is maintained by dmarc_sync_client, which reads Halo as
+   * the signed-in agent. Drift still surfaces in the unmapped table.
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     const windowDays = Number(env.NEW_SOURCE_WINDOW_DAYS ?? 3);
@@ -145,8 +379,7 @@ export default {
       body: JSON.stringify({ source: 'gts-dmarc-mcp', sources: pending }),
     });
 
-    // Only mark alerted once n8n has it, so a webhook outage retries tomorrow
-    // rather than silently swallowing the alert.
+    // Only mark alerted once n8n has it, so a webhook outage retries tomorrow.
     if (res.ok) {
       await markAlerted(
         env,
